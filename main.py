@@ -6,9 +6,11 @@ from __future__ import annotations
 import curses
 import json
 import os
+import sys
 import textwrap
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 
 import requests
 from bs4 import BeautifulSoup
@@ -18,12 +20,23 @@ from openai import OpenAI
 
 # ── Configuration ────────────────────────────────────────────────────────────
 
-load_dotenv()
+_env_path = Path(__file__).resolve().parent / ".env"
+if not _env_path.exists():
+    print(
+        "ERROR: .env file not found.\n"
+        f"Expected at: {_env_path}\n"
+        "Copy .env.example to .env and fill in your settings before running.",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+load_dotenv(_env_path)
 
 STATEMENT_ENDPOINT = os.getenv("STATEMENT_ENDPOINT", "")
 OPENAI_ENDPOINT = os.getenv("OPENAI_ENDPOINT", "http://127.0.0.1:6767/v1")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL_ID = os.getenv("OPENAI_MODEL_ID", "")
+EXTRA_PROMPT = os.getenv("EXTRA_PROMPT", "")
 
 STATEMENT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "statement.json")
 PROMPT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "PROCESS_PROMPT.md")
@@ -90,8 +103,51 @@ def save_statement(stmt: dict) -> None:
 
 
 def build_prompt(template: str, raw_statement: str) -> str:
-    """Replace the {{STATEMENT}} placeholder with actual weather text."""
+    """Replace the {{STATEMENT}} placeholder with actual weather text.
+
+    If EXTRA_PROMPT is set, it is injected right before the
+    ``--- / WEATHER STATEMENT:`` divider so the LLM sees the extra
+    instruction in context before the raw data.
+    """
+    if EXTRA_PROMPT:
+        # Insert the extra prompt right before the horizontal rule that
+        # precedes the WEATHER STATEMENT block.
+        divider = "\n---\n\nWEATHER STATEMENT:"
+        if divider in template:
+            template = template.replace(
+                divider,
+                f"\n{EXTRA_PROMPT}\n{divider}",
+            )
     return template.replace("{{STATEMENT}}", raw_statement)
+
+
+def _clean_llm_response(raw: str) -> str:
+    """Normalise the LLM response.
+
+    Some models (e.g. Qwen) wrap the answer in a JSON object like:
+        {"message": "…", "contexts": []}
+    Detect that, extract the *message* field, and convert literal
+    escape sequences (``\\n``) into real newlines so the TUI can
+    render them properly.
+    """
+    text = raw.strip()
+
+    # ── Try to parse as JSON and pull out "message" ──────────────────
+    if text.startswith("{"):
+        try:
+            obj = json.loads(text)
+            if isinstance(obj, dict) and "message" in obj:
+                text = obj["message"]
+        except (json.JSONDecodeError, TypeError):
+            pass  # not valid JSON — treat as plain text
+
+    # ── Normalise literal escape sequences ───────────────────────────
+    # Models sometimes emit the two-char sequence  \n  instead of a
+    # real newline (U+000A).  Same for \t.
+    text = text.replace("\\n", "\n")
+    text = text.replace("\\t", "\t")
+
+    return text
 
 
 def query_llm(prompt: str) -> str:
@@ -103,7 +159,8 @@ def query_llm(prompt: str) -> str:
         temperature=0.3,
         max_tokens=1024,
     )
-    return response.choices[0].message.content.strip()
+    raw = response.choices[0].message.content.strip()
+    return _clean_llm_response(raw)
 
 
 # ── Word-wrap utility ────────────────────────────────────────────────────────
@@ -268,8 +325,7 @@ def main(stdscr) -> None:
             break
         elif key == curses.KEY_UP:
             interval_min += INTERVAL_STEP_MINUTES
-            # Clamp remaining_sec to new max if it exceeds
-            remaining_sec = min(remaining_sec, interval_min * 60)
+            remaining_sec += INTERVAL_STEP_MINUTES * 60
         elif key == curses.KEY_DOWN:
             interval_min = max(MIN_INTERVAL_MINUTES, interval_min - INTERVAL_STEP_MINUTES)
             remaining_sec = min(remaining_sec, interval_min * 60)
