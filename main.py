@@ -150,17 +150,31 @@ def _clean_llm_response(raw: str) -> str:
     return text
 
 
-def query_llm(prompt: str) -> str:
-    """Send the prompt to the OpenAI-compatible endpoint and return the reply."""
+def query_llm(prompt: str) -> tuple[str, dict]:
+    """Send the prompt to the OpenAI-compatible endpoint.
+
+    Returns ``(reply_text, stats)`` where *stats* is a dict with keys
+    ``tokens`` (completion token count) and ``tok_per_sec``.
+    """
     client = OpenAI(base_url=OPENAI_ENDPOINT, api_key=OPENAI_API_KEY)
+    t0 = time.monotonic()
     response = client.chat.completions.create(
         model=OPENAI_MODEL_ID,
         messages=[{"role": "user", "content": prompt}],
         temperature=0.3,
         max_tokens=1024,
     )
+    elapsed = time.monotonic() - t0
     raw = response.choices[0].message.content.strip()
-    return _clean_llm_response(raw)
+
+    # Extract token count from the response when available.
+    tokens = 0
+    if response.usage and response.usage.completion_tokens:
+        tokens = response.usage.completion_tokens
+    tok_per_sec = tokens / elapsed if elapsed > 0 and tokens else 0.0
+
+    stats = {"tokens": tokens, "tok_per_sec": tok_per_sec, "elapsed": round(elapsed, 1)}
+    return _clean_llm_response(raw), stats
 
 
 # ── Word-wrap utility ────────────────────────────────────────────────────────
@@ -179,22 +193,25 @@ def wrap_text(text: str, width: int) -> list[str]:
 # ── Curses TUI ───────────────────────────────────────────────────────────────
 
 def _draw(stdscr, body_lines: list[str], scroll: int, interval_min: int,
-          remaining_sec: int, status_code: int | None, last_ts: str) -> int:
+          remaining_sec: int, status_code: int | None, last_ts: str,
+          llm_stats: dict | None = None) -> int:
     """Redraw the entire screen.  Returns the max valid scroll offset."""
     stdscr.erase()
     max_y, max_x = stdscr.getmaxyx()
-    if max_y < 4 or max_x < 20:
+    if max_y < 5 or max_x < 20:
         stdscr.addnstr(0, 0, "Terminal too small", max_x)
         stdscr.refresh()
         return 0
 
     # ── Colour pairs ─────────────────────────────────────────────────
     # 1 = title bar (black on cyan), 2 = error (red on black),
-    # 3 = bottom bar (black on cyan), 4 = status ok (green)
+    # 3 = bottom bar (black on cyan), 4 = status ok (green),
+    # 5 = stats bar (dim white on black)
     PAIR_TITLE = curses.color_pair(1)
     PAIR_ERROR = curses.color_pair(2)
     PAIR_BAR = curses.color_pair(3)
     PAIR_OK = curses.color_pair(4)
+    PAIR_STATS = curses.color_pair(5)
 
     # ── Top bar ──────────────────────────────────────────────────────
     title_left = f" {APP_TITLE} "
@@ -204,6 +221,23 @@ def _draw(stdscr, body_lines: list[str], scroll: int, interval_min: int,
         pad = 0
     top_line = title_left + " " * pad + title_right
     stdscr.addnstr(0, 0, top_line.ljust(max_x), max_x, PAIR_TITLE | curses.A_BOLD)
+
+    # ── Stats bar (second-to-last row) ────────────────────────────────
+    stats_line = ""
+    if llm_stats:
+        parts = []
+        if llm_stats.get("tokens"):
+            parts.append(f"{llm_stats['tokens']} tokens")
+        if llm_stats.get("tok_per_sec"):
+            parts.append(f"{llm_stats['tok_per_sec']:.1f} tok/s")
+        if llm_stats.get("elapsed"):
+            parts.append(f"{llm_stats['elapsed']}s")
+        stats_line = " " + "  ·  ".join(parts)
+    try:
+        stdscr.addnstr(max_y - 2, 0, stats_line.ljust(max_x), max_x,
+                       PAIR_STATS | curses.A_DIM)
+    except curses.error:
+        pass
 
     # ── Bottom bar ───────────────────────────────────────────────────
     mins, secs = divmod(remaining_sec, 60)
@@ -223,7 +257,7 @@ def _draw(stdscr, body_lines: list[str], scroll: int, interval_min: int,
         pass  # writing to bottom-right corner can raise on some terminals
 
     # ── Body ─────────────────────────────────────────────────────────
-    body_height = max_y - 2  # rows between top bar and bottom bar
+    body_height = max_y - 3  # rows between top bar and stats+bottom bars
     body_width = max_x - 1
     if body_width < 1:
         body_width = 1
@@ -252,8 +286,11 @@ def _draw(stdscr, body_lines: list[str], scroll: int, interval_min: int,
     return max_scroll
 
 
-def _run_cycle(template: str) -> tuple[list[str], int, str, int]:
-    """Execute one fetch → LLM cycle.  Returns (lines, status, timestamp, width_hint)."""
+def _run_cycle(template: str) -> tuple[list[str], int, str, dict]:
+    """Execute one fetch → LLM cycle.
+
+    Returns ``(lines, status, timestamp, llm_stats)``.
+    """
     stmt = fetch_statement()
     save_statement(stmt)
     status = stmt["result"]
@@ -261,15 +298,15 @@ def _run_cycle(template: str) -> tuple[list[str], int, str, int]:
 
     if status != 200:
         msg = f"HTTP {status}\n\n{stmt['raw']}" if status else f"Request failed\n\n{stmt['raw']}"
-        return msg.split("\n"), status, ts, 0
+        return msg.split("\n"), status, ts, {}
 
     prompt = build_prompt(template, stmt["raw"])
     try:
-        reply = query_llm(prompt)
+        reply, stats = query_llm(prompt)
     except Exception as exc:
-        return [f"LLM error: {exc}"], 0, ts, 0
+        return [f"LLM error: {exc}"], 0, ts, {}
 
-    return reply.split("\n"), status, ts, 0
+    return reply.split("\n"), status, ts, stats
 
 
 def main(stdscr) -> None:
@@ -285,6 +322,7 @@ def main(stdscr) -> None:
     curses.init_pair(2, curses.COLOR_RED, -1)
     curses.init_pair(3, curses.COLOR_BLACK, curses.COLOR_CYAN)
     curses.init_pair(4, curses.COLOR_GREEN, -1)
+    curses.init_pair(5, curses.COLOR_WHITE, -1)
 
     template = load_prompt_template()
 
@@ -295,6 +333,7 @@ def main(stdscr) -> None:
     body_lines: list[str] = ["Fetching weather statement…"]
     status_code: int | None = None
     last_ts = ""
+    llm_stats: dict = {}
     needs_fetch = True  # first run
 
     while True:
@@ -305,7 +344,7 @@ def main(stdscr) -> None:
             stdscr.addnstr(max_y // 2, max(0, max_x // 2 - 12), "Fetching weather data…", max_x)
             stdscr.refresh()
 
-            raw_lines, status_code, last_ts, _ = _run_cycle(template)
+            raw_lines, status_code, last_ts, llm_stats = _run_cycle(template)
             # Re-wrap to current terminal width
             _, max_x = stdscr.getmaxyx()
             body_lines = []
@@ -317,7 +356,7 @@ def main(stdscr) -> None:
 
         # ── Draw ─────────────────────────────────────────────────────
         max_scroll = _draw(stdscr, body_lines, scroll, interval_min,
-                           remaining_sec, status_code, last_ts)
+                           remaining_sec, status_code, last_ts, llm_stats)
 
         # ── Input ────────────────────────────────────────────────────
         try:
