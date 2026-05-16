@@ -234,7 +234,7 @@ def _draw(stdscr, body_lines: list[str], scroll: int, interval_min: int,
             parts.append(f"{llm_stats['tok_per_sec']:.1f} tok/s")
         if llm_stats.get("elapsed"):
             parts.append(f"{llm_stats['elapsed']}s")
-        stats_line = "· ".join(parts)
+        stats_line = " · ".join(parts)
     try:
         stdscr.addnstr(max_y - 2, 0, stats_line.ljust(max_x), max_x,
                        PAIR_STATS | curses.A_DIM)
