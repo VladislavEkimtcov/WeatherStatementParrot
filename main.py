@@ -226,6 +226,8 @@ def _draw(stdscr, body_lines: list[str], scroll: int, interval_min: int,
     stats_line = ""
     if llm_stats:
         parts = []
+        if OPENAI_MODEL_ID:
+            parts.append(OPENAI_MODEL_ID)
         if llm_stats.get("tokens"):
             parts.append(f"{llm_stats['tokens']} tokens")
         if llm_stats.get("tok_per_sec"):
