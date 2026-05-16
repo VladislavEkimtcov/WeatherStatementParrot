@@ -376,9 +376,9 @@ def main(stdscr) -> None:
     curses.init_pair(3, curses.COLOR_BLACK, curses.COLOR_CYAN)
     curses.init_pair(4, curses.COLOR_GREEN, -1)
     curses.init_pair(5, curses.COLOR_WHITE, -1)
-    curses.init_pair(6, curses.COLOR_WHITE, curses.COLOR_BLUE)
-    curses.init_pair(7, curses.COLOR_WHITE, curses.COLOR_MAGENTA)
-    curses.init_pair(8, curses.COLOR_WHITE, curses.COLOR_RED)
+    curses.init_pair(6, curses.COLOR_BLACK, curses.COLOR_CYAN)
+    curses.init_pair(7, curses.COLOR_WHITE, curses.COLOR_BLUE)
+    curses.init_pair(8, curses.COLOR_BLACK, curses.COLOR_GREEN)
     curses.init_pair(9, curses.COLOR_YELLOW, -1)
 
     template = load_prompt_template()
