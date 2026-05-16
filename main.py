@@ -228,6 +228,10 @@ def _draw(stdscr, body_lines: list[str], scroll: int, interval_min: int,
     PAIR_BAR = curses.color_pair(3)
     PAIR_OK = curses.color_pair(4)
     PAIR_STATS = curses.color_pair(5)
+    PAIR_H1 = curses.color_pair(6)
+    PAIR_H2 = curses.color_pair(7)
+    PAIR_H3 = curses.color_pair(8)
+    PAIR_STAR = curses.color_pair(9)
 
     # ── Top bar ──────────────────────────────────────────────────────
     title_left = f" {APP_TITLE} "
@@ -292,11 +296,40 @@ def _draw(stdscr, body_lines: list[str], scroll: int, interval_min: int,
             break
         line = body_lines[line_idx]
         attr = PAIR_ERROR | curses.A_BOLD if is_error else 0
-        # Highlight **bold** markdown markers with A_BOLD
-        if not is_error and line.strip().startswith("**"):
-            attr = PAIR_OK | curses.A_BOLD
+        
+        if not is_error:
+            stripped = line.strip()
+            if stripped.startswith("###"):
+                attr = PAIR_H3 | curses.A_BOLD
+                idx = line.find("###")
+                line = line[:idx] + line[idx+4:] if line.startswith("### ", idx) else line[:idx] + line[idx+3:]
+            elif stripped.startswith("##"):
+                attr = PAIR_H2 | curses.A_BOLD
+                idx = line.find("##")
+                line = line[:idx] + line[idx+3:] if line.startswith("## ", idx) else line[:idx] + line[idx+2:]
+            elif stripped.startswith("#"):
+                attr = PAIR_H1 | curses.A_BOLD
+                idx = line.find("#")
+                line = line[:idx] + line[idx+2:] if line.startswith("# ", idx) else line[:idx] + line[idx+1:]
+            elif stripped.startswith("*") and not stripped.startswith("**"):
+                idx = line.find("*")
+                if idx != -1:
+                    line = line[:idx] + "•" + line[idx+1:]
+
         try:
-            stdscr.addnstr(1 + i, 0, line, body_width, attr)
+            if not is_error and "**" in line:
+                parts = line.split("**")
+                x = 0
+                for idx, part in enumerate(parts):
+                    part_attr = attr | curses.A_BOLD if idx % 2 == 1 else attr
+                    if x >= body_width:
+                        break
+                    draw_len = min(len(part), body_width - x)
+                    if draw_len > 0:
+                        stdscr.addnstr(1 + i, x, part[:draw_len], draw_len, part_attr)
+                        x += draw_len
+            else:
+                stdscr.addnstr(1 + i, 0, line, body_width, attr)
         except curses.error:
             pass
 
@@ -343,6 +376,10 @@ def main(stdscr) -> None:
     curses.init_pair(3, curses.COLOR_BLACK, curses.COLOR_CYAN)
     curses.init_pair(4, curses.COLOR_GREEN, -1)
     curses.init_pair(5, curses.COLOR_WHITE, -1)
+    curses.init_pair(6, curses.COLOR_WHITE, curses.COLOR_BLUE)
+    curses.init_pair(7, curses.COLOR_WHITE, curses.COLOR_MAGENTA)
+    curses.init_pair(8, curses.COLOR_WHITE, curses.COLOR_RED)
+    curses.init_pair(9, curses.COLOR_YELLOW, -1)
 
     template = load_prompt_template()
 
