@@ -103,21 +103,12 @@ def save_statement(stmt: dict) -> None:
 
 
 def build_prompt(template: str, raw_statement: str) -> str:
-    """Replace the {{STATEMENT}} placeholder with actual weather text.
-
-    If EXTRA_PROMPT is set, it is injected right before the
-    ``--- / WEATHER STATEMENT:`` divider so the LLM sees the extra
-    instruction in context before the raw data.
-    """
+    """Replace the {{STATEMENT}} and {{EXTRA_PROMPT}} placeholders."""
     if EXTRA_PROMPT:
-        # Insert the extra prompt right before the horizontal rule that
-        # precedes the WEATHER STATEMENT block.
-        divider = "\n---\n\nWEATHER STATEMENT:"
-        if divider in template:
-            template = template.replace(
-                divider,
-                f"\n{EXTRA_PROMPT}\n{divider}",
-            )
+        template = template.replace("{{EXTRA_PROMPT}}", EXTRA_PROMPT)
+    else:
+        template = template.replace("{{EXTRA_PROMPT}}\n\n", "").replace("{{EXTRA_PROMPT}}", "")
+        
     return template.replace("{{STATEMENT}}", raw_statement)
 
 
