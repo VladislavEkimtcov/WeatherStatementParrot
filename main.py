@@ -102,6 +102,31 @@ def save_statement(stmt: dict) -> None:
         fh.write("\n")
 
 
+def ensure_statement_file() -> None:
+    """Ensure statement.json exists and adheres to the correct schema."""
+    default_stmt = {"timestamp": "", "result": 0, "raw": ""}
+    if os.path.exists(STATEMENT_FILE):
+        try:
+            with open(STATEMENT_FILE, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            if not isinstance(data, dict):
+                raise ValueError("Statement is not a JSON object")
+            
+            needs_save = False
+            for key, default_val in default_stmt.items():
+                if key not in data:
+                    data[key] = default_val
+                    needs_save = True
+            
+            if needs_save:
+                save_statement(data)
+            return
+        except Exception:
+            pass  # Corrupt or invalid JSON; recreate below
+
+    save_statement(default_stmt)
+
+
 def build_prompt(template: str, raw_statement: str) -> str:
     """Replace the {{STATEMENT}} and {{EXTRA_PROMPT}} placeholders."""
     if EXTRA_PROMPT:
@@ -304,6 +329,8 @@ def _run_cycle(template: str) -> tuple[list[str], int, str, dict]:
 
 def main(stdscr) -> None:
     """Curses main loop."""
+    ensure_statement_file()
+
     # ── Init curses ──────────────────────────────────────────────────
     curses.curs_set(0)
     stdscr.nodelay(False)
