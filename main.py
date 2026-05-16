@@ -264,7 +264,7 @@ def _draw(stdscr, body_lines: list[str], scroll: int, interval_min: int,
         timer_str = f" Next refresh in {hours:d}:{mins:02d}:{secs:02d}"
     else:
         timer_str = f" Next refresh in {mins:02d}:{secs:02d}"
-    help_str = "↑/↓ interval  r refresh  q quit "
+    help_str = "←/→ interval  ↑/↓ scroll  r refresh  q quit "
     bot_pad = max_x - len(timer_str) - len(help_str)
     if bot_pad < 0:
         bot_pad = 0
@@ -386,12 +386,16 @@ def main(stdscr) -> None:
 
         if key == ord("q") or key == ord("Q"):
             break
-        elif key == curses.KEY_UP:
+        elif key == curses.KEY_RIGHT:
             interval_min += INTERVAL_STEP_MINUTES
             remaining_sec += INTERVAL_STEP_MINUTES * 60
-        elif key == curses.KEY_DOWN:
+        elif key == curses.KEY_LEFT:
             interval_min = max(MIN_INTERVAL_MINUTES, interval_min - INTERVAL_STEP_MINUTES)
             remaining_sec = min(remaining_sec, interval_min * 60)
+        elif key == curses.KEY_UP:
+            scroll = max(0, scroll - 1)
+        elif key == curses.KEY_DOWN:
+            scroll = min(max_scroll, scroll + 1)
         elif key == ord("r") or key == ord("R"):
             needs_fetch = True
             continue
