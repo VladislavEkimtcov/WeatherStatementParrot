@@ -207,7 +207,11 @@ def _draw(stdscr, body_lines: list[str], scroll: int, interval_min: int,
 
     # ── Bottom bar ───────────────────────────────────────────────────
     mins, secs = divmod(remaining_sec, 60)
-    timer_str = f" Next refresh in {mins:02d}:{secs:02d}"
+    hours, mins = divmod(mins, 60)
+    if hours:
+        timer_str = f" Next refresh in {hours:d}:{mins:02d}:{secs:02d}"
+    else:
+        timer_str = f" Next refresh in {mins:02d}:{secs:02d}"
     help_str = "↑/↓ interval  r refresh  q quit "
     bot_pad = max_x - len(timer_str) - len(help_str)
     if bot_pad < 0:
