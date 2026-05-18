@@ -14,7 +14,7 @@ from pathlib import Path
 
 import requests
 from bs4 import BeautifulSoup
-from dotenv import load_dotenv
+from dotenv import load_dotenv, set_key
 from openai import OpenAI
 
 
@@ -44,6 +44,7 @@ PROMPT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "PROCESS_
 DEFAULT_INTERVAL_MINUTES = 60
 INTERVAL_STEP_MINUTES = 15
 MIN_INTERVAL_MINUTES = 15
+REFRESH_INTERVAL_ENV_VAR = "REFRESH_INTERVAL_MINUTES"
 
 APP_TITLE = "WeatherStatementParrot"
 
@@ -54,6 +55,35 @@ def load_prompt_template() -> str:
     """Read the PROCESS_PROMPT.md template from disk."""
     with open(PROMPT_FILE, "r", encoding="utf-8") as fh:
         return fh.read()
+
+
+def _normalize_interval_minutes(value: str | int | None) -> int:
+    """Return a valid refresh interval in minutes."""
+    try:
+        interval = int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return DEFAULT_INTERVAL_MINUTES
+    return max(MIN_INTERVAL_MINUTES, interval)
+
+
+def load_refresh_interval_minutes() -> int:
+    """Load the refresh interval from .env, falling back to the default."""
+    return _normalize_interval_minutes(os.getenv(REFRESH_INTERVAL_ENV_VAR))
+
+
+def persist_refresh_interval_minutes(interval_min: int) -> None:
+    """Persist the refresh interval to .env for future runs."""
+    normalized = _normalize_interval_minutes(interval_min)
+    os.environ[REFRESH_INTERVAL_ENV_VAR] = str(normalized)
+    try:
+        set_key(
+            str(_env_path),
+            REFRESH_INTERVAL_ENV_VAR,
+            str(normalized),
+            quote_mode="never",
+        )
+    except Exception:
+        pass
 
 
 def extract_statement(html: str) -> str:
@@ -363,6 +393,8 @@ def _run_cycle(template: str) -> tuple[list[str], int, str, dict]:
 def main(stdscr) -> None:
     """Curses main loop."""
     ensure_statement_file()
+    interval_min = load_refresh_interval_minutes()
+    persist_refresh_interval_minutes(interval_min)
 
     # ── Init curses ──────────────────────────────────────────────────
     curses.curs_set(0)
@@ -383,7 +415,6 @@ def main(stdscr) -> None:
 
     template = load_prompt_template()
 
-    interval_min = DEFAULT_INTERVAL_MINUTES
     remaining_sec = 0  # triggers immediate fetch on first tick
     scroll = 0
 
@@ -426,9 +457,13 @@ def main(stdscr) -> None:
         elif key == curses.KEY_RIGHT:
             interval_min += INTERVAL_STEP_MINUTES
             remaining_sec += INTERVAL_STEP_MINUTES * 60
+            persist_refresh_interval_minutes(interval_min)
         elif key == curses.KEY_LEFT:
+            previous_interval = interval_min
             interval_min = max(MIN_INTERVAL_MINUTES, interval_min - INTERVAL_STEP_MINUTES)
             remaining_sec = min(remaining_sec, interval_min * 60)
+            if interval_min != previous_interval:
+                persist_refresh_interval_minutes(interval_min)
         elif key == curses.KEY_UP:
             scroll = max(0, scroll - 1)
         elif key == curses.KEY_DOWN:

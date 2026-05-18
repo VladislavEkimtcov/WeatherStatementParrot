@@ -34,6 +34,7 @@ WeatherStatementParrot is a full-terminal, curses-based User Interface (TUI) for
    ```bash
    cp .env.example .env
    ```
+   Set `REFRESH_INTERVAL_MINUTES` if you want a startup interval other than the default 60 minutes.
 4. **Run the Parrot:**
    ```bash
    ./main.py
@@ -49,3 +50,6 @@ WeatherStatementParrot is a full-terminal, curses-based User Interface (TUI) for
 ## Configuration (`.env`)
 
 You can customize the prompt instructions using the `EXTRA_PROMPT` variable. This allows you to command the LLM to look for specific hyper-local impacts, specific aviation identifiers, or custom data points without modifying the underlying Python code.
+
+- `REFRESH_INTERVAL_MINUTES`: Startup refresh interval in minutes. If the value is missing or non-numeric, the app falls back to `60`; values below `15` are clamped up to `15`. The app also updates this value when you change the interval with `←` / `→`, so your latest timer setting persists for the next refresh loop and the next launch.
+
