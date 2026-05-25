@@ -9,7 +9,7 @@ import os
 import sys
 import textwrap
 import time
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 
 import requests
@@ -109,7 +109,7 @@ def fetch_statement() -> dict:
     Returns a dict matching the statement.json schema:
         {"timestamp": str, "result": int, "raw": str}
     """
-    ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     try:
         resp = requests.get(STATEMENT_ENDPOINT, timeout=30)
         status = resp.status_code
@@ -120,7 +120,7 @@ def fetch_statement() -> dict:
     except requests.RequestException as exc:
         status = 0
         raw = str(exc)
-        ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     return {"timestamp": ts, "result": status, "raw": raw}
 
