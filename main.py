@@ -46,7 +46,7 @@ INTERVAL_STEP_MINUTES = 15
 MIN_INTERVAL_MINUTES = 15
 REFRESH_INTERVAL_ENV_VAR = "REFRESH_INTERVAL_MINUTES"
 
-APP_TITLE = "WeatherStatementParrot"
+APP_TITLE = "NOAA Weather Statement"
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
