@@ -36,6 +36,8 @@ STATEMENT_ENDPOINT = os.getenv("STATEMENT_ENDPOINT", "")
 OPENAI_ENDPOINT = os.getenv("OPENAI_ENDPOINT", "http://127.0.0.1:6767/v1")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL_ID = os.getenv("OPENAI_MODEL_ID", "")
+FALLBACK_MODEL_1 = os.getenv("FALLBACK_MODEL_1", "")
+FALLBACK_MODEL_2 = os.getenv("FALLBACK_MODEL_2", "")
 EXTRA_PROMPT = os.getenv("EXTRA_PROMPT", "")
 
 STATEMENT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "statement.json")
@@ -196,16 +198,17 @@ def _clean_llm_response(raw: str) -> str:
     return text
 
 
-def query_llm(prompt: str) -> tuple[str, dict]:
+def query_llm(prompt: str, model_id: str | None = None) -> tuple[str, dict]:
     """Send the prompt to the OpenAI-compatible endpoint.
 
     Returns ``(reply_text, stats)`` where *stats* is a dict with keys
-    ``tokens`` (completion token count) and ``tok_per_sec``.
+    ``tokens`` (completion token count), ``tok_per_sec``, and ``model``.
     """
+    used_model = model_id or OPENAI_MODEL_ID
     client = OpenAI(base_url=OPENAI_ENDPOINT, api_key=OPENAI_API_KEY)
     t0 = time.monotonic()
     response = client.chat.completions.create(
-        model=OPENAI_MODEL_ID,
+        model=used_model,
         messages=[{"role": "user", "content": prompt}],
         temperature=0.3,
         max_tokens=1024,
@@ -219,8 +222,36 @@ def query_llm(prompt: str) -> tuple[str, dict]:
         tokens = response.usage.completion_tokens
     tok_per_sec = tokens / elapsed if elapsed > 0 and tokens else 0.0
 
-    stats = {"tokens": tokens, "tok_per_sec": tok_per_sec, "elapsed": round(elapsed, 1)}
+    stats = {
+        "tokens": tokens,
+        "tok_per_sec": tok_per_sec,
+        "elapsed": round(elapsed, 1),
+        "model": used_model,
+    }
     return _clean_llm_response(raw), stats
+
+
+def query_llm_with_fallback(prompt: str) -> tuple[str, dict]:
+    """Try the primary model, then each fallback in order.
+
+    Returns ``(reply_text, stats)`` from the first model that succeeds.
+    Raises the last exception if every model fails.
+    """
+    models_to_try = [OPENAI_MODEL_ID]
+    if FALLBACK_MODEL_1:
+        models_to_try.append(FALLBACK_MODEL_1)
+    if FALLBACK_MODEL_2:
+        models_to_try.append(FALLBACK_MODEL_2)
+
+    last_exc: Exception | None = None
+    for model_id in models_to_try:
+        try:
+            return query_llm(prompt, model_id=model_id)
+        except Exception as exc:
+            last_exc = exc
+
+    # All models failed — re-raise the last exception.
+    raise last_exc  # type: ignore[misc]
 
 
 # ── Word-wrap utility ────────────────────────────────────────────────────────
@@ -276,7 +307,9 @@ def _draw(stdscr, body_lines: list[str], scroll: int, interval_min: int,
     stats_line = ""
     if llm_stats:
         parts = []
-        if OPENAI_MODEL_ID:
+        if llm_stats.get("model"):
+            parts.append(llm_stats["model"])
+        elif OPENAI_MODEL_ID:
             parts.append(OPENAI_MODEL_ID)
         if llm_stats.get("tokens"):
             parts.append(f"{llm_stats['tokens']} tokens")
@@ -383,7 +416,7 @@ def _run_cycle(template: str) -> tuple[list[str], int, str, dict]:
 
     prompt = build_prompt(template, stmt["raw"])
     try:
-        reply, stats = query_llm(prompt)
+        reply, stats = query_llm_with_fallback(prompt)
     except Exception as exc:
         return [f"LLM error: {exc}"], 0, ts, {}
 
