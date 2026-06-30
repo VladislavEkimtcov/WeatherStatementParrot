@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import curses
 import json
+import re
 import os
 import sys
 import textwrap
@@ -196,6 +197,21 @@ def _clean_llm_response(raw: str) -> str:
     text = text.replace("\\t", "\t")
 
     return text
+
+
+def _strip_think_block(text: str) -> str:
+    """Remove ``<think>…</think>`` blocks from *text* for display.
+
+    The block may span multiple lines.  If the model emits an
+    opening ``<think>`` without a closing tag, everything from
+    ``<think>`` onward is removed.
+    """
+    # re.DOTALL lets '.' match newlines so multi-line blocks are handled.
+    cleaned = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
+    # Unclosed <think> — strip from the tag to the end of the string.
+    cleaned = re.sub(r"<think>.*", "", cleaned, flags=re.DOTALL)
+    # Collapse leading blank lines left over after removal.
+    return cleaned.strip()
 
 
 def query_llm(prompt: str, model_id: str | None = None) -> tuple[str, dict]:
@@ -420,7 +436,9 @@ def _run_cycle(template: str) -> tuple[list[str], int, str, dict]:
     except Exception as exc:
         return [f"LLM error: {exc}"], 0, ts, {}
 
-    return reply.split("\n"), status, ts, stats
+    # Strip <think> blocks for display; token stats are already computed.
+    display_reply = _strip_think_block(reply)
+    return display_reply.split("\n"), status, ts, stats
 
 
 def main(stdscr) -> None:
