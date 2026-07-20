@@ -171,6 +171,20 @@ def build_prompt(template: str, raw_statement: str) -> str:
     return template.replace("{{STATEMENT}}", raw_statement)
 
 
+_CITE_RE = re.compile(r"\s*\[?(\d+)\]?\s*", re.IGNORECASE)
+
+
+def _bold_citations(text: str) -> str:
+    """Bold DeepSeek-style ``N`` inline citation markers.
+
+    Some models (DeepSeek in particular) emit inline citation refs like
+    ``1.`` pointing at a source index.  Convert these into
+    Markdown bold (``**[1]**``) so the existing ``**`` renderer in
+    ``_draw`` / ``_draw_chat`` highlights them inline.
+    """
+    return _CITE_RE.sub(lambda m: f"**[{m.group(1)}]**", text)
+
+
 def _clean_llm_response(raw: str) -> str:
     """Normalise the LLM response.
 
@@ -196,6 +210,9 @@ def _clean_llm_response(raw: str) -> str:
     # real newline (U+000A).  Same for \t.
     text = text.replace("\\n", "\n")
     text = text.replace("\\t", "\t")
+
+    # ── Bold DeepSeek-style N citation markers ───────────
+    text = _bold_citations(text)
 
     return text
 
@@ -616,6 +633,10 @@ def _chat_mode(stdscr, system_prompt: str, raw_statement: str, initial_synopsis:
                 is_thinking = True
                 thinking_thread = threading.Thread(target=async_chat_worker, args=(messages.copy(),))
                 thinking_thread.start()
+            else:
+                # Sending an empty message hides the chat and returns
+                # to the main synopsis view (mirrors the old ESC exit).
+                break
                 
         elif key in (127, 8, curses.KEY_BACKSPACE):  # Backspace
             if cursor_pos > 0:
@@ -911,6 +932,7 @@ def main(stdscr) -> None:
             # Restore main-loop curses settings after returning from chat mode.
             stdscr.nodelay(False)
             stdscr.timeout(1000)
+            scroll = 0  # Scroll back to the top of the synopsis
             continue
         elif key == curses.KEY_PPAGE:  # Page Up
             scroll = max(0, scroll - (curses.LINES - 3))
