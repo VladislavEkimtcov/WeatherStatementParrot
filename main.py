@@ -10,6 +10,7 @@ import os
 import sys
 import textwrap
 import time
+import threading
 from datetime import datetime
 from pathlib import Path
 
@@ -270,6 +271,385 @@ def query_llm_with_fallback(prompt: str) -> tuple[str, dict]:
     raise last_exc  # type: ignore[misc]
 
 
+def query_llm_chat(messages: list[dict[str, str]], model_id: str | None = None) -> tuple[str, dict]:
+    """Send the chat history to the OpenAI-compatible endpoint.
+
+    Returns ``(reply_text, stats)``.
+    """
+    used_model = model_id or OPENAI_MODEL_ID
+    client = OpenAI(base_url=OPENAI_ENDPOINT, api_key=OPENAI_API_KEY)
+    t0 = time.monotonic()
+    response = client.chat.completions.create(
+        model=used_model,
+        messages=messages,  # type: ignore[arg-type]
+        temperature=0.3,
+        max_tokens=1024,
+    )
+    elapsed = time.monotonic() - t0
+    raw = response.choices[0].message.content.strip()
+
+    # Extract token count from the response when available.
+    tokens = 0
+    if response.usage and response.usage.completion_tokens:
+        tokens = response.usage.completion_tokens
+    tok_per_sec = tokens / elapsed if elapsed > 0 and tokens else 0.0
+
+    stats = {
+        "tokens": tokens,
+        "tok_per_sec": tok_per_sec,
+        "elapsed": round(elapsed, 1),
+        "model": used_model,
+    }
+    return _clean_llm_response(raw), stats
+
+
+def query_llm_chat_with_fallback(messages: list[dict[str, str]]) -> tuple[str, dict]:
+    """Try the primary model for chat, then each fallback in order.
+
+    Returns ``(reply_text, stats)`` from the first model that succeeds.
+    """
+    models_to_try = [OPENAI_MODEL_ID]
+    if FALLBACK_MODEL_1:
+        models_to_try.append(FALLBACK_MODEL_1)
+    if FALLBACK_MODEL_2:
+        models_to_try.append(FALLBACK_MODEL_2)
+
+    last_exc: Exception | None = None
+    for model_id in models_to_try:
+        try:
+            return query_llm_chat(messages, model_id=model_id)
+        except Exception as exc:
+            last_exc = exc
+
+        # All models failed — re-raise the last exception.
+    raise last_exc  # type: ignore[misc]
+
+
+def _build_chat_display(messages: list[dict[str, str]], width: int) -> list[tuple[str, int]]:
+    """Build wrapped display lines with alignment and attributes.
+    
+    Returns list of (wrapped_line_text, alignment_flag) where:
+      alignment_flag: 0 = left-aligned, 1 = right-aligned, 2 = header/meta
+    """
+    display_lines: list[tuple[str, int]] = []
+    
+    # We skip the system message and first user message (the raw weather statement).
+    # We start display from the assistant's initial synopsis.
+    for i, msg in enumerate(messages):
+        if i < 2:
+            continue
+        
+        role = msg["role"]
+        content = msg["content"]
+        
+        if role == "assistant":
+            display_lines.append(("### PARROT", 2))
+            # Format and wrap assistant reply
+            cleaned_reply = _strip_think_block(content)
+            for paragraph in cleaned_reply.split("\n"):
+                if paragraph.strip() == "":
+                    display_lines.append(("", 0))
+                else:
+                    wrapped = textwrap.wrap(paragraph, width=width)
+                    for wl in (wrapped or [""]):
+                        display_lines.append((wl, 0))
+            display_lines.append(("", 0))  # blank line separator
+            
+        elif role == "user":
+            display_lines.append(("### USER", 2))
+            for paragraph in content.split("\n"):
+                if paragraph.strip() == "":
+                    display_lines.append(("", 1))
+                else:
+                    wrapped = textwrap.wrap(paragraph, width=width)
+                    for wl in (wrapped or [""]):
+                        display_lines.append((wl, 1))
+            display_lines.append(("", 1))  # blank line separator
+            
+    return display_lines
+
+
+def _draw_chat(stdscr, display_lines: list[tuple[str, int]], scroll: int, input_buf: str,
+               cursor_pos: int, is_thinking: bool, spinner_char: str, llm_stats: dict | None,
+               max_x: int, max_y: int) -> int:
+    stdscr.erase()
+    
+    PAIR_TITLE = curses.color_pair(1)
+    PAIR_BAR = curses.color_pair(3)
+    PAIR_STATS = curses.color_pair(5)
+    PAIR_H1 = curses.color_pair(6)
+    PAIR_H2 = curses.color_pair(7)
+    PAIR_H3 = curses.color_pair(8)
+    PAIR_USER_MSG = curses.color_pair(10)
+    
+    # ── Top bar ──────────────────────────────────────────────────────
+    title_left = f" {APP_TITLE} — Follow-Up Chat "
+    try:
+        stdscr.addnstr(0, 0, title_left.ljust(max_x), max_x, PAIR_TITLE | curses.A_BOLD)
+    except curses.error:
+        pass
+
+    # ── Bottom input bar & Help bar ──────────────────────────────────
+    # The layout from bottom up:
+    # max_y - 1: Help bar (black on cyan)
+    # max_y - 2: Input line (> prompt)
+    # max_y - 3: Stats bar / status
+    
+    # Help bar
+    help_str = " Enter send  ESC exit  PageUp/Dn scroll "
+    try:
+        stdscr.addnstr(max_y - 1, 0, help_str.ljust(max_x), max_x, PAIR_BAR | curses.A_BOLD)
+    except curses.error:
+        pass  # writing to bottom-right corner can raise on some terminals
+    
+    # Input line with prompt
+    prompt = "> "
+    input_display = prompt + input_buf
+    # Ensure it doesn't overflow max_x
+    if len(input_display) >= max_x:
+        input_display = input_display[-(max_x - 1):]
+    try:
+        stdscr.addnstr(max_y - 2, 0, input_display.ljust(max_x), max_x)
+    except curses.error:
+        pass
+    
+    # Stats / status bar
+    stats_line = ""
+    if is_thinking:
+        stats_line = f"Thinking {spinner_char}..."
+    elif llm_stats:
+        parts = []
+        if llm_stats.get("model"):
+            parts.append(llm_stats["model"])
+        if llm_stats.get("tokens"):
+            parts.append(f"{llm_stats['tokens']} tokens")
+        if llm_stats.get("tok_per_sec"):
+            parts.append(f"{llm_stats['tok_per_sec']:.1f} tok/s")
+        if llm_stats.get("elapsed"):
+            parts.append(f"{llm_stats['elapsed']}s")
+        stats_line = " · ".join(parts)
+    
+    try:
+        stdscr.addnstr(max_y - 3, 0, stats_line.ljust(max_x), max_x, PAIR_STATS | curses.A_DIM)
+    except curses.error:
+        pass
+    
+    # ── Body (Scrollable Chat Area) ──────────────────────────────────
+    body_height = max_y - 4  # leaving top bar (1), stats bar (1), input line (1), help bar (1)
+    body_width = max_x - 2
+    if body_width < 1:
+        body_width = 1
+        
+    max_scroll = max(0, len(display_lines) - body_height)
+    if scroll > max_scroll:
+        scroll = max_scroll
+        
+    for i in range(body_height):
+        line_idx = scroll + i
+        if line_idx >= len(display_lines):
+            break
+            
+        line_text, alignment = display_lines[line_idx]
+        
+        try:
+            if alignment == 2:  # Headers
+                if line_text == "### USER":
+                    # Right aligned header
+                    header_str = "### USER"
+                    x_pos = max(0, max_x - len(header_str) - 1)
+                    stdscr.addnstr(1 + i, x_pos, header_str, len(header_str), PAIR_H3 | curses.A_BOLD)
+                else:
+                    # Left aligned header
+                    stdscr.addnstr(1 + i, 0, line_text, body_width, PAIR_H2 | curses.A_BOLD)
+            elif alignment == 1:  # User messages
+                x_pos = max(0, max_x - len(line_text) - 1)
+                stdscr.addnstr(1 + i, x_pos, line_text, len(line_text), PAIR_USER_MSG)
+            else:  # Assistant messages
+                # Handle inline bolding ** text ** if any
+                if "**" in line_text:
+                    parts = line_text.split("**")
+                    x = 0
+                    for idx, part in enumerate(parts):
+                        part_attr = curses.A_BOLD if idx % 2 == 1 else 0
+                        if x >= body_width:
+                            break
+                        draw_len = min(len(part), body_width - x)
+                        if draw_len > 0:
+                            stdscr.addnstr(1 + i, x, part[:draw_len], draw_len, part_attr)
+                            x += draw_len
+                else:
+                    stdscr.addnstr(1 + i, 0, line_text, body_width)
+        except curses.error:
+            pass
+                
+    # Place cursor at the end of prompt + current cursor position
+    # The prompt is at max_y - 2, and starts at x=2 (len("> "))
+    cursor_x = min(max_x - 1, 2 + cursor_pos)
+    try:
+        stdscr.move(max_y - 2, cursor_x)
+    except curses.error:
+        pass
+    
+    stdscr.refresh()
+    return max_scroll
+
+
+def _chat_mode(stdscr, system_prompt: str, raw_statement: str, initial_synopsis: str, initial_stats: dict) -> None:
+    curses.curs_set(1)  # show cursor
+    stdscr.nodelay(True)  # non-blocking input
+    
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": raw_statement},
+        {"role": "assistant", "content": initial_synopsis}
+    ]
+    
+    input_buf = ""
+    cursor_pos = 0
+    scroll = 0
+    
+    # Spinner frame counter
+    spinner_frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+    spinner_idx = 0
+    
+    is_thinking = False
+    thinking_thread: threading.Thread | None = None
+    chat_reply = ""
+    chat_stats: dict = initial_stats
+    chat_error: str | None = None
+    
+    def async_chat_worker(msgs: list[dict[str, str]]):
+        nonlocal chat_reply, chat_stats, chat_error, is_thinking
+        try:
+            chat_reply, chat_stats = query_llm_chat_with_fallback(msgs)
+            chat_error = None
+        except Exception as e:
+            chat_reply = ""
+            chat_error = str(e)
+        finally:
+            is_thinking = False
+            
+    # Initial build of display lines
+    max_y, max_x = stdscr.getmaxyx()
+    display_lines = _build_chat_display(messages, max(20, max_x - 4))
+    scroll = max(0, len(display_lines) - (max_y - 4))
+    
+    while True:
+        max_y, max_x = stdscr.getmaxyx()
+        
+        # Advance spinner if thinking
+        spinner_char = spinner_frames[spinner_idx]
+        
+        # Draw screen
+        max_scroll = _draw_chat(
+            stdscr, display_lines, scroll, input_buf, cursor_pos,
+            is_thinking, spinner_char, chat_stats, max_x, max_y
+        )
+        
+        # Handle async query completion
+        if not is_thinking and thinking_thread is not None:
+            thinking_thread.join()
+            thinking_thread = None
+            if chat_error:
+                messages.append({"role": "assistant", "content": f"Error: {chat_error}"})
+            else:
+                messages.append({"role": "assistant", "content": chat_reply})
+            display_lines = _build_chat_display(messages, max(20, max_x - 4))
+            scroll = max(0, len(display_lines) - (max_y - 4))
+            
+        # Standard loop delay (~50ms)
+        time.sleep(0.05)
+        if is_thinking:
+            spinner_idx = (spinner_idx + 1) % len(spinner_frames)
+            
+        try:
+            key = stdscr.getch()
+        except curses.error:
+            key = -1
+            
+        if key == -1:
+            continue
+            
+        if key == 27:  # ESC key
+            # Check if there are other keys queued (ESC sequence) or just ESC
+            stdscr.nodelay(True)
+            next_key = stdscr.getch()
+            if next_key == -1:
+                # User hit ESC -> Exit chat mode
+                break
+            continue
+            
+        if is_thinking:
+            # Block inputs during thinking (or just scroll keys)
+            if key == curses.KEY_UP:
+                scroll = max(0, scroll - 1)
+            elif key == curses.KEY_DOWN:
+                scroll = min(max_scroll, scroll + 1)
+            elif key == curses.KEY_PPAGE:
+                scroll = max(0, scroll - (max_y - 4))
+            elif key == curses.KEY_NPAGE:
+                scroll = min(max_scroll, scroll + (max_y - 4))
+            continue
+            
+        # Keyboard Input Handlers
+        if key == curses.KEY_UP:
+            scroll = max(0, scroll - 1)
+        elif key == curses.KEY_DOWN:
+            scroll = min(max_scroll, scroll + 1)
+        elif key == curses.KEY_PPAGE:
+            scroll = max(0, scroll - (max_y - 4))
+        elif key == curses.KEY_NPAGE:
+            scroll = min(max_scroll, scroll + (max_y - 4))
+            
+        elif key in (10, 13, curses.KEY_ENTER):  # Enter
+            if input_buf.strip():
+                # Append user message
+                messages.append({"role": "user", "content": input_buf.strip()})
+                input_buf = ""
+                cursor_pos = 0
+                
+                # Rebuild display
+                display_lines = _build_chat_display(messages, max(20, max_x - 4))
+                scroll = max(0, len(display_lines) - (max_y - 4))
+                
+                # Trigger async query
+                is_thinking = True
+                thinking_thread = threading.Thread(target=async_chat_worker, args=(messages.copy(),))
+                thinking_thread.start()
+                
+        elif key in (127, 8, curses.KEY_BACKSPACE):  # Backspace
+            if cursor_pos > 0:
+                input_buf = input_buf[:cursor_pos - 1] + input_buf[cursor_pos:]
+                cursor_pos -= 1
+                
+        elif key == curses.KEY_DC:  # Delete
+            if cursor_pos < len(input_buf):
+                input_buf = input_buf[:cursor_pos] + input_buf[cursor_pos + 1:]
+                
+        elif key == curses.KEY_LEFT:
+            cursor_pos = max(0, cursor_pos - 1)
+            
+        elif key == curses.KEY_RIGHT:
+            cursor_pos = min(len(input_buf), cursor_pos + 1)
+            
+        elif key == curses.KEY_HOME:
+            cursor_pos = 0
+            
+        elif key == curses.KEY_END:
+            cursor_pos = len(input_buf)
+            
+        elif key == curses.KEY_RESIZE:
+            # Rebuild and adjust scroll
+            display_lines = _build_chat_display(messages, max(20, max_x - 4))
+            scroll = max(0, len(display_lines) - (max_y - 4))
+            
+        elif 32 <= key <= 126:  # Printable character
+            input_buf = input_buf[:cursor_pos] + chr(key) + input_buf[cursor_pos:]
+            cursor_pos += 1
+            
+    curses.curs_set(0)  # hide cursor again before returning
+
+
 # ── Word-wrap utility ────────────────────────────────────────────────────────
 
 def wrap_text(text: str, width: int) -> list[str]:
@@ -347,7 +727,7 @@ def _draw(stdscr, body_lines: list[str], scroll: int, interval_min: int,
         timer_str = f" Refresh in {hours:d}:{mins:02d}:{secs:02d}"
     else:
         timer_str = f" Refresh in {mins:02d}:{secs:02d}"
-    help_str = " ←/→ adjust  r refresh  q quit "
+    help_str = " ←/→ adjust  r refresh  f follow-up  q quit "
     bot_pad = max_x - len(timer_str) - len(help_str)
     if bot_pad < 0:
         bot_pad = 0
@@ -416,10 +796,10 @@ def _draw(stdscr, body_lines: list[str], scroll: int, interval_min: int,
     return max_scroll
 
 
-def _run_cycle(template: str) -> tuple[list[str], int, str, dict]:
+def _run_cycle(template: str) -> tuple[list[str], int, str, dict, str]:
     """Execute one fetch → LLM cycle.
 
-    Returns ``(lines, status, timestamp, llm_stats)``.
+    Returns ``(lines, status, timestamp, llm_stats, raw_statement)``.
     """
     stmt = fetch_statement()
     save_statement(stmt)
@@ -428,17 +808,17 @@ def _run_cycle(template: str) -> tuple[list[str], int, str, dict]:
 
     if status != 200:
         msg = f"HTTP {status}\n\n{stmt['raw']}" if status else f"Request failed\n\n{stmt['raw']}"
-        return msg.split("\n"), status, ts, {}
+        return msg.split("\n"), status, ts, {}, stmt.get("raw", "")
 
     prompt = build_prompt(template, stmt["raw"])
     try:
         reply, stats = query_llm_with_fallback(prompt)
     except Exception as exc:
-        return [f"LLM error: {exc}"], 0, ts, {}
+        return [f"LLM error: {exc}"], 0, ts, {}, stmt.get("raw", "")
 
     # Strip <think> blocks for display; token stats are already computed.
     display_reply = _strip_think_block(reply)
-    return display_reply.split("\n"), status, ts, stats
+    return display_reply.split("\n"), status, ts, stats, stmt.get("raw", "")
 
 
 def main(stdscr) -> None:
@@ -463,6 +843,7 @@ def main(stdscr) -> None:
     curses.init_pair(7, curses.COLOR_WHITE, curses.COLOR_BLUE)
     curses.init_pair(8, curses.COLOR_BLACK, curses.COLOR_GREEN)
     curses.init_pair(9, curses.COLOR_YELLOW, -1)
+    curses.init_pair(10, curses.COLOR_CYAN, -1)
 
     template = load_prompt_template()
 
@@ -473,6 +854,8 @@ def main(stdscr) -> None:
     status_code: int | None = None
     last_ts = ""
     llm_stats: dict = {}
+    raw_statement = ""
+    synopsis_text = ""
     needs_fetch = True  # first run
 
     while True:
@@ -483,7 +866,8 @@ def main(stdscr) -> None:
             stdscr.addnstr(max_y // 2, max(0, max_x // 2 - 12), "Fetching weather data…", max_x)
             stdscr.refresh()
 
-            raw_lines, status_code, last_ts, llm_stats = _run_cycle(template)
+            raw_lines, status_code, last_ts, llm_stats, raw_statement = _run_cycle(template)
+            synopsis_text = "\n".join(raw_lines)
             # Re-wrap to current terminal width
             _, max_x = stdscr.getmaxyx()
             body_lines = []
@@ -521,6 +905,12 @@ def main(stdscr) -> None:
             scroll = min(max_scroll, scroll + 1)
         elif key == ord("r") or key == ord("R"):
             needs_fetch = True
+            continue
+        elif (key == ord("f") or key == ord("F")) and status_code == 200:
+            _chat_mode(stdscr, template, raw_statement, synopsis_text, llm_stats)
+            # Restore main-loop curses settings after returning from chat mode.
+            stdscr.nodelay(False)
+            stdscr.timeout(1000)
             continue
         elif key == curses.KEY_PPAGE:  # Page Up
             scroll = max(0, scroll - (curses.LINES - 3))
