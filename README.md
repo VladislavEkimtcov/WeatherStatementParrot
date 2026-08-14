@@ -45,6 +45,8 @@ WeatherStatementParrot is a full-terminal, curses-based User Interface (TUI) for
 - `←` / `→` : Decrease/Increase the fetch interval (15-minute increments).
 - `↑` / `↓` : Scroll the parsed weather statement up and down. (Works seamlessly with your mouse wheel!)
 - `r` : Force an immediate fetch and refresh.
+- `o` / `O` : Toggle view mode between AI Synopsis and Original raw product statement (`<pre class="glossaryProduct">`). Mode persists across refreshes!
+- `f` : Enter follow-up AI chat mode.
 - `q` : Quit the application.
 
 ## Configuration (`.env`)

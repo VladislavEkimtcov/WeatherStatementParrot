@@ -209,9 +209,20 @@ def render_symbian_html(html_content: str) -> str:
     body = soup.body if soup.body else soup
     rendered = _render_node(body)
 
+    # Final safety pass: strip doctype and any lingering unhandled HTML tags
+    rendered = re.sub(r"<!DOCTYPE[^>]*>", "", rendered, flags=re.IGNORECASE)
+    rendered = re.sub(r"</?[a-zA-Z][^>]*>", "", rendered)
+
     rendered = re.sub(r"\n{3,}", "\n\n", rendered)
     lines = [line.rstrip() for line in rendered.split("\n")]
     return "\n".join(lines).strip()
+
+
+def _has_html_tags(text: str) -> bool:
+    """Check if text contains HTML markup or doctypes."""
+    if not text:
+        return False
+    return bool(re.search(r"<!DOCTYPE|<html|<head|<body|<div|<h[1-6]|<p[ >]|<br|<span>|</[a-zA-Z]+>", text, re.IGNORECASE))
 
 
 def extract_statement(html: str) -> str:
@@ -245,11 +256,14 @@ def fetch_statement() -> dict:
         if status == 200:
             raw = extract_statement(resp.text)
         else:
-            raw = resp.text[:500]
+            raw = extract_statement(resp.text[:2000]) if _has_html_tags(resp.text[:2000]) else resp.text[:500]
     except requests.RequestException as exc:
         status = 0
         raw = str(exc)
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    if _has_html_tags(raw):
+        raw = render_symbian_html(raw)
 
     return {"timestamp": ts, "result": status, "raw": raw}
 
@@ -336,6 +350,10 @@ def _clean_llm_response(raw: str) -> str:
     text = text.replace("\\n", "\n")
     text = text.replace("\\t", "\t")
 
+    # ── Render HTML through Symbian HTML engine if HTML tags present ───
+    if _has_html_tags(text):
+        text = render_symbian_html(text)
+
     # ── Bold DeepSeek-style N citation markers ───────────
     text = _bold_citations(text)
 
@@ -353,8 +371,10 @@ def _strip_think_block(text: str) -> str:
     cleaned = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
     # Unclosed <think> — strip from the tag to the end of the string.
     cleaned = re.sub(r"<think>.*", "", cleaned, flags=re.DOTALL)
-    # Collapse leading blank lines left over after removal.
-    return cleaned.strip()
+    cleaned = cleaned.strip()
+    if _has_html_tags(cleaned):
+        cleaned = render_symbian_html(cleaned)
+    return cleaned
 
 
 def query_llm(prompt: str, model_id: str | None = None) -> tuple[str, dict]:
@@ -813,7 +833,7 @@ def wrap_text(text: str, width: int) -> list[str]:
 
 def _draw(stdscr, body_lines: list[str], scroll: int, interval_min: int,
           remaining_sec: int, status_code: int | None, last_ts: str,
-          llm_stats: dict | None = None) -> int:
+          llm_stats: dict | None = None, view_mode: str = "synopsis") -> int:
     """Redraw the entire screen.  Returns the max valid scroll offset."""
     stdscr.erase()
     max_y, max_x = stdscr.getmaxyx()
@@ -837,7 +857,8 @@ def _draw(stdscr, body_lines: list[str], scroll: int, interval_min: int,
     PAIR_STAR = curses.color_pair(9)
 
     # ── Top bar ──────────────────────────────────────────────────────
-    title_left = f" {APP_TITLE} "
+    mode_tag = " — Original (<pre>)" if view_mode == "original" else ""
+    title_left = f" {APP_TITLE}{mode_tag} "
     title_right = f" {last_ts} " if last_ts else ""
     pad = max_x - len(title_left) - len(title_right)
     if pad < 0:
@@ -873,7 +894,9 @@ def _draw(stdscr, body_lines: list[str], scroll: int, interval_min: int,
         timer_str = f" Refresh in {hours:d}:{mins:02d}:{secs:02d}"
     else:
         timer_str = f" Refresh in {mins:02d}:{secs:02d}"
-    help_str = " ←/→ adjust  r refresh  f follow-up  q quit "
+    
+    toggle_opt = "o synopsis" if view_mode == "original" else "o original"
+    help_str = f" ←/→ adjust  r refresh  {toggle_opt}  f follow-up  q quit "
     bot_pad = max_x - len(timer_str) - len(help_str)
     if bot_pad < 0:
         bot_pad = 0
@@ -953,17 +976,24 @@ def _run_cycle(template: str) -> tuple[list[str], int, str, dict, str]:
     ts = stmt["timestamp"]
 
     if status != 200:
-        msg = f"HTTP {status}\n\n{stmt['raw']}" if status else f"Request failed\n\n{stmt['raw']}"
+        raw_err = render_symbian_html(stmt['raw']) if _has_html_tags(stmt['raw']) else stmt['raw']
+        msg = f"HTTP {status}\n\n{raw_err}" if status else f"Request failed\n\n{raw_err}"
         return msg.split("\n"), status, ts, {}, stmt.get("raw", "")
 
     prompt = build_prompt(template, stmt["raw"])
     try:
         reply, stats = query_llm_with_fallback(prompt)
     except Exception as exc:
-        return [f"LLM error: {exc}"], 0, ts, {}, stmt.get("raw", "")
+        err_msg = str(exc)
+        if _has_html_tags(err_msg):
+            err_msg = render_symbian_html(err_msg)
+        return [f"LLM error: {err_msg}"], 0, ts, {}, stmt.get("raw", "")
 
     # Strip <think> blocks for display; token stats are already computed.
     display_reply = _strip_think_block(reply)
+    if _has_html_tags(display_reply):
+        display_reply = render_symbian_html(display_reply)
+
     return display_reply.split("\n"), status, ts, stats, stmt.get("raw", "")
 
 
@@ -1002,6 +1032,8 @@ def main(stdscr) -> None:
     llm_stats: dict = {}
     raw_statement = ""
     synopsis_text = ""
+    synopsis_lines: list[str] = []
+    view_mode = "synopsis"  # "synopsis" or "original"
     needs_fetch = True  # first run
 
     while True:
@@ -1012,20 +1044,26 @@ def main(stdscr) -> None:
             stdscr.addnstr(max_y // 2, max(0, max_x // 2 - 12), "Fetching weather data…", max_x)
             stdscr.refresh()
 
-            raw_lines, status_code, last_ts, llm_stats, raw_statement = _run_cycle(template)
-            synopsis_text = "\n".join(raw_lines)
-            # Re-wrap to current terminal width
+            synopsis_lines, status_code, last_ts, llm_stats, raw_statement = _run_cycle(template)
+            synopsis_text = "\n".join(synopsis_lines)
+
+            # Re-wrap according to active view_mode
             _, max_x = stdscr.getmaxyx()
-            body_lines = []
-            for ln in raw_lines:
-                body_lines.extend(wrap_text(ln, max(20, max_x - 2)))
+            if view_mode == "original":
+                body_lines = wrap_text(raw_statement, max(20, max_x - 2))
+            else:
+                body_lines = []
+                for ln in synopsis_lines:
+                    body_lines.extend(wrap_text(ln, max(20, max_x - 2)))
+
             scroll = 0
             remaining_sec = interval_min * 60
             needs_fetch = False
 
         # ── Draw ─────────────────────────────────────────────────────
         max_scroll = _draw(stdscr, body_lines, scroll, interval_min,
-                           remaining_sec, status_code, last_ts, llm_stats)
+                           remaining_sec, status_code, last_ts, llm_stats,
+                           view_mode=view_mode)
 
         # ── Input ────────────────────────────────────────────────────
         try:
@@ -1049,8 +1087,19 @@ def main(stdscr) -> None:
             scroll = max(0, scroll - 1)
         elif key == curses.KEY_DOWN:
             scroll = min(max_scroll, scroll + 1)
-        elif key == ord("r") or key == ord("R"):
+        elif key == ord("r"):
             needs_fetch = True
+            continue
+        elif key in (ord("o"), ord("O")):
+            view_mode = "original" if view_mode == "synopsis" else "synopsis"
+            _, max_x = stdscr.getmaxyx()
+            if view_mode == "original":
+                body_lines = wrap_text(raw_statement, max(20, max_x - 2))
+            else:
+                body_lines = []
+                for ln in synopsis_lines:
+                    body_lines.extend(wrap_text(ln, max(20, max_x - 2)))
+            scroll = 0
             continue
         elif (key == ord("f") or key == ord("F")) and status_code == 200:
             _chat_mode(stdscr, template, raw_statement, synopsis_text, llm_stats)
@@ -1064,10 +1113,14 @@ def main(stdscr) -> None:
         elif key == curses.KEY_NPAGE:  # Page Down
             scroll = min(max_scroll, scroll + (curses.LINES - 3))
         elif key == curses.KEY_RESIZE:
-            # Terminal resized — re-wrap body text
+            # Terminal resized — re-wrap body text based on active view_mode
             _, max_x = stdscr.getmaxyx()
-            raw_text = "\n".join(body_lines)
-            body_lines = wrap_text(raw_text, max(20, max_x - 2))
+            if view_mode == "original":
+                body_lines = wrap_text(raw_statement, max(20, max_x - 2))
+            else:
+                body_lines = []
+                for ln in synopsis_lines:
+                    body_lines.extend(wrap_text(ln, max(20, max_x - 2)))
             scroll = 0
 
         # ── Countdown ────────────────────────────────────────────────
