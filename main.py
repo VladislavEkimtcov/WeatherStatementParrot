@@ -15,7 +15,7 @@ from datetime import datetime
 from pathlib import Path
 
 import requests
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, NavigableString, Tag
 from dotenv import load_dotenv, set_key
 from openai import OpenAI
 
@@ -90,21 +90,146 @@ def persist_refresh_interval_minutes(interval_min: int) -> None:
         pass
 
 
+def render_symbian_html(html_content: str) -> str:
+    """Minimalist HTML handling engine for monochrome Symbian mobile web.
+
+    Renders HTML into clean, monochrome-friendly plain text with structured
+    formatting for headings, paragraphs, lists, tables, links, images,
+    blockquotes, and inline emphasis while stripping scripts and styles.
+    """
+    if not html_content or not html_content.strip():
+        return ""
+
+    soup = BeautifulSoup(html_content, "html.parser")
+
+    # Strip non-content / non-display tags
+    for tag in soup.find_all(
+        ["script", "style", "noscript", "head", "meta", "link", "svg", "canvas", "iframe", "form", "input", "button", "select", "option"]
+    ):
+        tag.decompose()
+
+    def _render_node(node, list_depth: int = 0) -> str:
+        if isinstance(node, NavigableString):
+            text = str(node)
+            if node.find_parent("pre"):
+                return text
+            cleaned = re.sub(r"\s+", " ", text)
+            return cleaned
+
+        if not isinstance(node, Tag):
+            return ""
+
+        tag_name = node.name.lower()
+
+        if tag_name == "br":
+            return "\n"
+        elif tag_name == "hr":
+            return "\n----------------------------------------\n"
+        elif tag_name in ("h1", "h2", "h3", "h4", "h5", "h6"):
+            inner = "".join(_render_node(c, list_depth) for c in node.children).strip()
+            if not inner:
+                return ""
+            prefix = "# " if tag_name == "h1" else ("## " if tag_name == "h2" else "### ")
+            return f"\n\n{prefix}{inner}\n\n"
+        elif tag_name in ("p", "div", "section", "article", "header", "footer", "nav"):
+            inner = "".join(_render_node(c, list_depth) for c in node.children).strip()
+            if not inner:
+                return ""
+            return f"\n\n{inner}\n\n"
+        elif tag_name in ("ul", "ol"):
+            items = []
+            is_ol = tag_name == "ol"
+            item_idx = 1
+            indent = "  " * list_depth
+            for child in node.children:
+                if isinstance(child, Tag) and child.name.lower() == "li":
+                    bullet = f"{item_idx}. " if is_ol else "• "
+                    item_inner = "".join(_render_node(c, list_depth + 1) for c in child.children).strip()
+                    if item_inner:
+                        items.append(f"{indent}{bullet}{item_inner}")
+                    item_idx += 1
+            if not items:
+                return ""
+            return "\n" + "\n".join(items) + "\n"
+        elif tag_name == "a":
+            href = node.get("href", "").strip()
+            inner = "".join(_render_node(c, list_depth) for c in node.children).strip()
+            if href and href != inner and not href.startswith("javascript:"):
+                if inner:
+                    return f"{inner} ({href})"
+                return href
+            return inner
+        elif tag_name == "img":
+            alt = node.get("alt", "").strip()
+            if alt:
+                return f"[Image: {alt}]"
+            return "[Image]"
+        elif tag_name == "table":
+            rows = []
+            for tr in node.find_all("tr", recursive=True):
+                cells = []
+                for cell in tr.find_all(["th", "td"], recursive=False):
+                    cell_text = "".join(_render_node(c, list_depth) for c in cell.children).strip()
+                    cell_text = cell_text.replace("\n", " ")
+                    cells.append(cell_text)
+                if cells:
+                    rows.append(" | ".join(cells))
+            if not rows:
+                return ""
+            has_headers = bool(node.find("th"))
+            table_lines = []
+            if len(rows) > 0:
+                table_lines.append(f"| {rows[0]} |")
+                if has_headers:
+                    header_sep = "| " + " | ".join(["---"] * len(rows[0].split(" | "))) + " |"
+                    table_lines.append(header_sep)
+                for r in rows[1:]:
+                    table_lines.append(f"| {r} |")
+            return "\n\n" + "\n".join(table_lines) + "\n\n"
+        elif tag_name == "blockquote":
+            inner = "".join(_render_node(c, list_depth) for c in node.children).strip()
+            if not inner:
+                return ""
+            quoted_lines = [f"> {line}" if line.strip() else ">" for line in inner.split("\n")]
+            return "\n\n" + "\n".join(quoted_lines) + "\n\n"
+        elif tag_name == "pre":
+            return f"\n\n{node.get_text()}\n\n"
+        elif tag_name in ("b", "strong"):
+            inner = "".join(_render_node(c, list_depth) for c in node.children).strip()
+            return f"**{inner}**" if inner else ""
+        elif tag_name in ("i", "em"):
+            inner = "".join(_render_node(c, list_depth) for c in node.children).strip()
+            return f"*{inner}*" if inner else ""
+        elif tag_name == "code":
+            inner = "".join(_render_node(c, list_depth) for c in node.children).strip()
+            return f"`{inner}`" if inner else ""
+        else:
+            return "".join(_render_node(c, list_depth) for c in node.children)
+
+    body = soup.body if soup.body else soup
+    rendered = _render_node(body)
+
+    rendered = re.sub(r"\n{3,}", "\n\n", rendered)
+    lines = [line.rstrip() for line in rendered.split("\n")]
+    return "\n".join(lines).strip()
+
+
 def extract_statement(html: str) -> str:
     """Pull the raw weather statement out of the NOAA HTML page.
 
     The actual forecast text lives inside a <pre> tag (class
-    'glossaryProduct') on the NOAA product page.  Fall back to the
-    first <pre> if the class isn't present, or to the full body text.
+    'glossaryProduct') on the NOAA product page. Fall back to the
+    first <pre> if the class isn't present, or process through the
+    minimalist monochrome Symbian smartphone HTML engine.
     """
     soup = BeautifulSoup(html, "html.parser")
     pre = soup.find("pre", class_="glossaryProduct")
     if pre is None:
         pre = soup.find("pre")
-    if pre is not None:
+    if pre is not None and pre.get_text().strip():
         return pre.get_text()
-    # Absolute fallback — strip all tags.
-    return soup.get_text()
+    
+    return render_symbian_html(html)
 
 
 def fetch_statement() -> dict:
