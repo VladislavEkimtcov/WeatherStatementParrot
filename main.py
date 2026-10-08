@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import curses
+import html
 import json
 import re
 import os
@@ -310,14 +311,16 @@ def build_prompt(template: str, raw_statement: str) -> str:
     return template.replace("{{STATEMENT}}", raw_statement)
 
 
-_CITE_RE = re.compile(r"\s*\[?(\d+)\]?\s*", re.IGNORECASE)
+# Brackets are required: matching bare digits would turn every number in
+# the forecast ("mid-80s", "60 mph") into a citation.
+_CITE_RE = re.compile(r"\[(?:citation:\s*)?(\d+)\]", re.IGNORECASE)
 
 
 def _bold_citations(text: str) -> str:
-    """Bold DeepSeek-style ``N`` inline citation markers.
+    """Bold DeepSeek-style ``[N]`` / ``[citation:N]`` inline citation markers.
 
     Some models (DeepSeek in particular) emit inline citation refs like
-    ``1.`` pointing at a source index.  Convert these into
+    ``[citation:1]`` pointing at a source index.  Convert these into
     Markdown bold (``**[1]**``) so the existing ``**`` renderer in
     ``_draw`` / ``_draw_chat`` highlights them inline.
     """
@@ -350,11 +353,25 @@ def _clean_llm_response(raw: str) -> str:
     text = text.replace("\\n", "\n")
     text = text.replace("\\t", "\t")
 
+    # ── Drop <think> reasoning before HTML detection ─────────────────
+    # A closing </think> looks like HTML and would send the whole reply
+    # through the HTML engine, flattening its Markdown onto one line.
+    text = _strip_think_block(text)
+
     # ── Render HTML through Symbian HTML engine if HTML tags present ───
     if _has_html_tags(text):
         text = render_symbian_html(text)
 
-    # ── Bold DeepSeek-style N citation markers ───────────
+    # ── Decode HTML entities (&gt;, &deg;, …) ────────────────────────
+    # Plain-text replies never reach the HTML engine, so entities would
+    # otherwise show up verbatim.  Repeat to undo double escaping.
+    for _ in range(3):
+        unescaped = html.unescape(text)
+        if unescaped == text:
+            break
+        text = unescaped
+
+    # ── Bold DeepSeek-style [N] citation markers ─────────────────────
     text = _bold_citations(text)
 
     return text
@@ -508,13 +525,8 @@ def _build_chat_display(messages: list[dict[str, str]], width: int) -> list[tupl
             display_lines.append(("### PARROT", 2))
             # Format and wrap assistant reply
             cleaned_reply = _strip_think_block(content)
-            for paragraph in cleaned_reply.split("\n"):
-                if paragraph.strip() == "":
-                    display_lines.append(("", 0))
-                else:
-                    wrapped = textwrap.wrap(paragraph, width=width)
-                    for wl in (wrapped or [""]):
-                        display_lines.append((wl, 0))
+            for wl in wrap_text(cleaned_reply, width):
+                display_lines.append((wl, 0))
             display_lines.append(("", 0))  # blank line separator
             
         elif role == "user":
@@ -819,13 +831,25 @@ def _chat_mode(stdscr, system_prompt: str, raw_statement: str, initial_synopsis:
 # ── Word-wrap utility ────────────────────────────────────────────────────────
 
 def wrap_text(text: str, width: int) -> list[str]:
-    """Word-wrap *text* to *width* columns, preserving existing newlines."""
+    """Word-wrap *text* to *width* columns, preserving existing newlines.
+
+    A ``**bold**`` span that crosses a wrap point is closed at the end of
+    the line and re-opened on the next one, because the renderers toggle
+    bold per line.
+    """
     lines: list[str] = []
     for paragraph in text.split("\n"):
         if paragraph.strip() == "":
             lines.append("")
-        else:
-            lines.extend(textwrap.wrap(paragraph, width=width) or [""])
+            continue
+        bold_open = False
+        for wl in textwrap.wrap(paragraph, width=width) or [""]:
+            if bold_open:
+                wl = "**" + wl
+            bold_open = wl.count("**") % 2 == 1
+            if bold_open:
+                wl += "**"
+            lines.append(wl)
     return lines
 
 
