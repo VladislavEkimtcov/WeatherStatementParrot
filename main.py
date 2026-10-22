@@ -39,6 +39,14 @@ STATEMENT_ENDPOINT = os.getenv("STATEMENT_ENDPOINT", "")
 OPENAI_ENDPOINT = os.getenv("OPENAI_ENDPOINT", "http://127.0.0.1:6767/v1")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL_ID = os.getenv("OPENAI_MODEL_ID", "")
+# Reasoning effort sent as `reasoning_effort` (Lumen and vLLM accept these levels).
+# Empty = not sent, so the endpoint's default applies.
+EFFORT_LEVELS = ("minimal", "low", "medium", "high")
+REASONING_EFFORT = os.getenv("REASONING_EFFORT", "").strip().lower()
+if REASONING_EFFORT and REASONING_EFFORT not in EFFORT_LEVELS:
+    print(f"WARNING: REASONING_EFFORT={REASONING_EFFORT!r} is not one of {EFFORT_LEVELS}; ignoring it.",
+          file=sys.stderr)
+    REASONING_EFFORT = ""
 FALLBACK_MODEL_1 = os.getenv("FALLBACK_MODEL_1", "")
 FALLBACK_MODEL_2 = os.getenv("FALLBACK_MODEL_2", "")
 EXTRA_PROMPT = os.getenv("EXTRA_PROMPT", "")
@@ -394,6 +402,67 @@ def _strip_think_block(text: str) -> str:
     return cleaned
 
 
+ERROR_LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "llm_errors.log")
+
+
+def _fallback_chain() -> list[str]:
+    """Primary model followed by any configured fallbacks, in order."""
+    models = [OPENAI_MODEL_ID]
+    if FALLBACK_MODEL_1:
+        models.append(FALLBACK_MODEL_1)
+    if FALLBACK_MODEL_2:
+        models.append(FALLBACK_MODEL_2)
+    return models
+
+
+def _effort_body() -> dict:
+    """Extra request-body fields: reasoning_effort when one is configured, else nothing."""
+    return {"reasoning_effort": REASONING_EFFORT} if REASONING_EFFORT else {}
+
+
+def _extract_content(response) -> str:
+    """Return the reply text, or raise a descriptive error when it is empty.
+
+    Reasoning models can spend the whole token budget on reasoning and return
+    ``content=None``; without this check that surfaces as an opaque AttributeError.
+    """
+    choice = response.choices[0]
+    content = choice.message.content
+    if not content or not content.strip():
+        raise RuntimeError(f"empty response content (finish_reason={choice.finish_reason!r})")
+    return content.strip()
+
+
+def record_llm_failure(model_id: str, exc: Exception) -> None:
+    """Append one failed attempt to ERROR_LOG_FILE. Best-effort: never raises."""
+    entry = {
+        "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "model": model_id,
+        "error_type": type(exc).__name__,
+        "message": str(exc),
+    }
+    try:
+        with open(ERROR_LOG_FILE, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except OSError:
+        pass
+
+
+def load_last_llm_failure() -> dict | None:
+    """Return the most recent entry in ERROR_LOG_FILE, or None if there is none."""
+    try:
+        with open(ERROR_LOG_FILE, encoding="utf-8") as fh:
+            lines = [ln for ln in fh.read().splitlines() if ln.strip()]
+    except OSError:
+        return None
+    if not lines:
+        return None
+    try:
+        return json.loads(lines[-1])
+    except json.JSONDecodeError:
+        return None
+
+
 def query_llm(prompt: str, model_id: str | None = None) -> tuple[str, dict]:
     """Send the prompt to the OpenAI-compatible endpoint.
 
@@ -407,10 +476,11 @@ def query_llm(prompt: str, model_id: str | None = None) -> tuple[str, dict]:
         model=used_model,
         messages=[{"role": "user", "content": prompt}],
         temperature=0.3,
-        max_tokens=1024,
+        max_tokens=128000,
+        extra_body=_effort_body(),
     )
     elapsed = time.monotonic() - t0
-    raw = response.choices[0].message.content.strip()
+    raw = _extract_content(response)
 
     # Extract token count from the response when available.
     tokens = 0
@@ -433,17 +503,12 @@ def query_llm_with_fallback(prompt: str) -> tuple[str, dict]:
     Returns ``(reply_text, stats)`` from the first model that succeeds.
     Raises the last exception if every model fails.
     """
-    models_to_try = [OPENAI_MODEL_ID]
-    if FALLBACK_MODEL_1:
-        models_to_try.append(FALLBACK_MODEL_1)
-    if FALLBACK_MODEL_2:
-        models_to_try.append(FALLBACK_MODEL_2)
-
     last_exc: Exception | None = None
-    for model_id in models_to_try:
+    for model_id in _fallback_chain():
         try:
             return query_llm(prompt, model_id=model_id)
         except Exception as exc:
+            record_llm_failure(model_id, exc)
             last_exc = exc
 
     # All models failed — re-raise the last exception.
@@ -462,10 +527,11 @@ def query_llm_chat(messages: list[dict[str, str]], model_id: str | None = None) 
         model=used_model,
         messages=messages,  # type: ignore[arg-type]
         temperature=0.3,
-        max_tokens=1024,
+        max_tokens=128000,
+        extra_body=_effort_body(),
     )
     elapsed = time.monotonic() - t0
-    raw = response.choices[0].message.content.strip()
+    raw = _extract_content(response)
 
     # Extract token count from the response when available.
     tokens = 0
@@ -487,20 +553,15 @@ def query_llm_chat_with_fallback(messages: list[dict[str, str]]) -> tuple[str, d
 
     Returns ``(reply_text, stats)`` from the first model that succeeds.
     """
-    models_to_try = [OPENAI_MODEL_ID]
-    if FALLBACK_MODEL_1:
-        models_to_try.append(FALLBACK_MODEL_1)
-    if FALLBACK_MODEL_2:
-        models_to_try.append(FALLBACK_MODEL_2)
-
     last_exc: Exception | None = None
-    for model_id in models_to_try:
+    for model_id in _fallback_chain():
         try:
             return query_llm_chat(messages, model_id=model_id)
         except Exception as exc:
+            record_llm_failure(model_id, exc)
             last_exc = exc
 
-        # All models failed — re-raise the last exception.
+    # All models failed — re-raise the last exception.
     raise last_exc  # type: ignore[misc]
 
 
@@ -920,7 +981,7 @@ def _draw(stdscr, body_lines: list[str], scroll: int, interval_min: int,
         timer_str = f" Refresh in {mins:02d}:{secs:02d}"
     
     toggle_opt = "o synopsis" if view_mode == "original" else "o original"
-    help_str = f" ←/→ adjust  r refresh  {toggle_opt}  f follow-up  q quit "
+    help_str = f" ←/→ adjust  r refresh  {toggle_opt}  f follow-up  e last error  q quit "
     bot_pad = max_x - len(timer_str) - len(help_str)
     if bot_pad < 0:
         bot_pad = 0
@@ -1019,6 +1080,36 @@ def _run_cycle(template: str) -> tuple[list[str], int, str, dict, str]:
         display_reply = render_symbian_html(display_reply)
 
     return display_reply.split("\n"), status, ts, stats, stmt.get("raw", "")
+
+
+def _show_last_failure(stdscr) -> None:
+    """Overlay the most recent LLM failure; any key returns to the main view."""
+    failure = load_last_llm_failure()
+    max_y, max_x = stdscr.getmaxyx()
+    if failure is None:
+        lines = ["No LLM failures recorded."]
+    else:
+        lines = [
+            "Most recent LLM failure",
+            "",
+            f"Time:  {failure.get('ts', '?')}",
+            f"Model: {failure.get('model', '?')}",
+            f"Error: {failure.get('error_type', '?')}",
+            "",
+            *wrap_text(failure.get("message", ""), max(20, max_x - 4)),
+        ]
+    lines += ["", "Press any key to return."]
+
+    stdscr.erase()
+    for i, ln in enumerate(lines[: max_y - 1]):
+        try:
+            stdscr.addnstr(i, 2, ln, max_x - 3, curses.A_BOLD if i == 0 else 0)
+        except curses.error:
+            pass
+    stdscr.refresh()
+    stdscr.timeout(-1)  # block until a key is pressed
+    stdscr.getch()
+    stdscr.timeout(1000)
 
 
 def main(stdscr) -> None:
@@ -1131,6 +1222,9 @@ def main(stdscr) -> None:
             stdscr.nodelay(False)
             stdscr.timeout(1000)
             scroll = 0  # Scroll back to the top of the synopsis
+            continue
+        elif key in (ord("e"), ord("E")):
+            _show_last_failure(stdscr)
             continue
         elif key == curses.KEY_PPAGE:  # Page Up
             scroll = max(0, scroll - (curses.LINES - 3))
